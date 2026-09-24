@@ -740,7 +740,7 @@ class DirectionResult:
     r2: float                  # in-sample R^2
     r2_cv: float               # cross-validated R^2
     group_shares: dict[str, float]   # Shapley share of R^2 per family (sum=r2)
-    feature_weights: dict[str, float]  # relative weight per feature (sum=r2)
+    feature_weights: dict[str, float]  # relative weight per column of F (sum=r2)
     noise_frac: float          # 1 - r2
     r2_ci: tuple[float, float] | None = None  # bootstrap CI on r2
 

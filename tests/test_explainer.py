@@ -482,3 +482,59 @@ def test_shap_total_bar(explainer):
 def test_johnson_total_bar(explainer):
     _, _, fig = explainer.johnson(figure_type="bar", total=True)
     assert fig.axes[0].get_xticklabels()[-1].get_text().startswith("total")
+
+
+# ------------------------------------------------ spline-basis aggregation
+@pytest.fixture
+def spline_dataset():
+    import fva
+    rng = np.random.default_rng(0)
+    n = 400
+    raw = pd.DataFrame({"a": rng.uniform(-2, 2, n), "b": rng.normal(size=n),
+                        "c": rng.normal(size=n)})
+    z1 = np.sin(2 * raw["a"]) + 0.1 * rng.normal(size=n)
+    z2 = raw["b"] ** 2 + raw["c"] + 0.1 * rng.normal(size=n)
+    df_latent = pd.DataFrame({"z1": z1, "z2": z2, "z3": 0.1 * rng.normal(size=n)})
+    df_feat, feat_to_group, _ = fva.expand_features(
+        raw, spline_df=5, groups={"a": "A", "b": "BC", "c": "BC"},
+        interactions=[("a", "b")])
+    return df_latent, df_feat, feat_to_group
+
+
+def test_johnson_sums_spline_columns_into_source(spline_dataset):
+    df_latent, df_feat, feat_to_group = spline_dataset
+    ex = FeatureGroundedDecomposition(df_latent, df_feat, feat_to_group)
+    table = ex.johnson().table
+    assert list(table.columns) == ["a", "b", "c", "a x b", _NOISE_COL]
+    for d, label in zip(ex.directions, table.index):
+        for src in ("a", "b", "c", "a x b"):
+            cols = [f for f in ex.feature_names if ex.feature_sources[f] == src]
+            assert len(cols) > 1
+            assert table.loc[label, src] == pytest.approx(
+                sum(d.feature_weights[f] for f in cols))
+    # The tensor product spans both main effects, so the bank is nearly
+    # collinear and Johnson's total drifts from the Gram-cache R^2 at ~1e-5.
+    assert np.allclose(table.sum(axis=1), 1.0, atol=1e-3)
+    assert ex.global_budget(by="feature") is not None
+
+
+def test_feature_sources_empty_disables_aggregation(spline_dataset):
+    df_latent, df_feat, feat_to_group = spline_dataset
+    ex = FeatureGroundedDecomposition(df_latent, df_feat, feat_to_group,
+                                      feature_sources={})
+    table = ex.johnson().table
+    assert list(table.columns) == list(df_feat.columns) + [_NOISE_COL]
+
+
+def test_feature_sources_split_across_groups_raises(spline_dataset):
+    df_latent, df_feat, feat_to_group = spline_dataset
+    bad = dict(feat_to_group)
+    bad[df_feat.columns[0]] = "other"
+    with pytest.raises(ValueError, match="more than one group"):
+        FeatureGroundedDecomposition(df_latent, df_feat, bad)
+
+
+def test_non_spline_columns_are_not_aggregated(dataset):
+    df_latent, df_feat, feat_to_group = dataset
+    ex = FeatureGroundedDecomposition(df_latent, df_feat, feat_to_group)
+    assert ex.source_names == list(df_feat.columns)

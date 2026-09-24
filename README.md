@@ -161,6 +161,33 @@ the feature rather than by taste:
   that wrap-around. The spline has no wrap, has local support, is better
   conditioned, and at `spline_df=1` degenerates *exactly* to the raw column.
 
+The `basis` argument sets the expansion for non-periodic numeric columns:
+
+| `basis` | columns per feature | use it for |
+|---|---|---|
+| `"none"` | 1 (the raw column) | the unexpanded, linear bank |
+| `"spline"` (default) | `spline_df` | smooth continuous features |
+| `"hurdle_spline"` | `spline_df + 1` | zero-inflated features such as gene expression |
+| `"fourier"` | `2 * harmonics + 1` | ablation only (same as `mode="circular"`) |
+
+A hurdle spline is an indicator of leaving the point mass (`hurdle_at`, default
+0) plus a cubic B-spline fitted to the values off it, with knots at quantiles of
+those values alone. A plain spline on a column that is mostly zeros loses its
+quantile knots to the point mass and degrades into one global polynomial. A
+column with no values at the point mass falls back to a plain spline, with a
+warning.
+
+```python
+df_feat, feat_to_group, spec = fva.expand_features(
+    df_genes, basis="hurdle_spline", spline_df=4, groups=gene_to_lineage,
+)
+```
+
+`FeatureGroundedDecomposition.johnson()` sums the weights of every spline and
+hurdle column of a feature into one entry for that feature (see its
+`feature_sources` argument), since the weight of a single basis column means
+nothing on its own.
+
 `mode="spline"` and `mode="circular"` force one basis onto everything, warning on
 the columns they mis-handle, so the choice of basis can be ablated rather than
 asserted. Every expansion stays pooled in its source column's group, so one

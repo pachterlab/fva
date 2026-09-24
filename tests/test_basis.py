@@ -27,6 +27,7 @@ from fva.basis import (
     DEFAULT_LEVELS,
     _max_supported_width,
     harmonic_basis,
+    hurdle_spline_basis,
     spline_basis,
 )
 
@@ -316,3 +317,123 @@ def test_ladder_carries_the_interaction_at_every_rung(grid):
                                figure=False)
     # 2 main effects of width L, plus their L^2 product, at every rung.
     assert list(table["n_features"]) == [1 + 1 + 1, 2 + 2 + 4, 3 + 3 + 9]
+
+
+# ------------------------------------------------------------ basis options
+def _zero_inflated(n=2000, zero_frac=0.9, seed=0):
+    rng = np.random.default_rng(seed)
+    x = np.where(rng.uniform(size=n) < zero_frac, 0.0, rng.lognormal(0.5, 0.5, n))
+    return x, rng
+
+
+def test_hurdle_basis_width_names_and_zero_rows():
+    x, _ = _zero_inflated()
+    B, names = hurdle_spline_basis(x, 4, name="g")
+    assert B.shape == (x.size, 5)
+    assert names == ["g=nz", "g=s1", "g=s2", "g=s3", "g=s4"]
+    assert np.array_equal(B[:, 0], (x != 0).astype(float))
+    assert np.allclose(B[x == 0, 1:], 0.0)
+    assert np.linalg.matrix_rank(np.column_stack([np.ones(x.size), B])) == 6
+
+
+def test_hurdle_basis_contains_the_raw_column():
+    x, _ = _zero_inflated()
+    B, _ = hurdle_spline_basis(x, 4)
+    X = np.column_stack([np.ones(x.size), B])
+    coef, *_ = np.linalg.lstsq(X, x, rcond=None)
+    assert np.allclose(X @ coef, x, atol=1e-8)
+
+
+def test_hurdle_basis_places_knots_off_the_point_mass():
+    # A plain spline on a 90%-zero column loses its quantile knots to the point
+    # mass and becomes one global polynomial.  At equal width, the hurdle spline
+    # should fit a response among the nonzero values better and stay better
+    # conditioned.
+    x, rng = _zero_inflated(n=4000, zero_frac=0.9)
+    off = x > 0
+    y = np.where(off, 1 + np.tanh(4 * (x - np.median(x[off]))), 0.0)
+    y = y + 0.05 * rng.normal(size=x.size)
+
+    def r2_off(B):
+        X = np.column_stack([np.ones(x.size), B])
+        res = y - X @ np.linalg.lstsq(X, y, rcond=None)[0]
+        return 1 - res[off].var() / y[off].var()
+
+    def cond(B):
+        return np.linalg.cond((B - B.mean(0)) / B.std(0))
+
+    plain, _ = spline_basis(x, 8)
+    hurdle, _ = hurdle_spline_basis(x, 7)
+    assert r2_off(hurdle) > r2_off(plain) + 0.01
+    assert r2_off(hurdle) > 0.98
+    assert cond(hurdle) < cond(plain) / 2
+
+
+def test_hurdle_basis_on_a_binary_column_is_the_indicator():
+    B, names = hurdle_spline_basis(np.array([0.0, 1.0, 0.0, 1.0]), 4, name="b")
+    assert names == ["b=nz"] and B.shape == (4, 1)
+
+
+def test_hurdle_basis_needs_a_point_mass():
+    with pytest.raises(ValueError, match="needs both"):
+        hurdle_spline_basis(np.linspace(1, 2, 20), 3)
+
+
+def test_hurdle_basis_propagates_nan():
+    x, _ = _zero_inflated(n=200)
+    x[3] = np.nan
+    B, _ = hurdle_spline_basis(x, 3)
+    assert np.isnan(B[3]).all() and np.isfinite(np.delete(B, 3, axis=0)).all()
+
+
+def test_expand_features_basis_options():
+    x, rng = _zero_inflated(n=500)
+    df = pd.DataFrame({"g": x, "c": rng.normal(size=500)})
+    groups = {"g": "G", "c": "C"}
+
+    none, m, spec = expand_features(df, basis="none", groups=groups)
+    assert list(none.columns) == ["g", "c"] and spec.loc["g", "basis"] == "identity"
+
+    spl, _, _ = expand_features(df, basis="spline", spline_df=4, groups=groups)
+    assert spl.shape[1] == 8
+
+    with pytest.warns(UserWarning, match="plain spline"):
+        hur, m, spec = expand_features(df, basis="hurdle_spline", spline_df=4,
+                                       groups=groups)
+    assert [c for c in hur.columns if c.startswith("g=")] == [
+        "g=nz", "g=s1", "g=s2", "g=s3", "g=s4"]
+    assert spec.loc["c", "basis"].startswith("bspline")   # no zeros: fell back
+    assert spec.loc["g", "basis"].startswith("hurdle_bspline")
+    assert {m[c] for c in hur.columns if c.startswith("g=")} == {"G"}
+
+    with pytest.warns(UserWarning, match="non-periodic"):
+        four, _, _ = expand_features(df, basis="fourier", harmonics=2, groups=groups)
+    with pytest.warns(UserWarning, match="non-periodic"):
+        circ, _, _ = expand_features(df, mode="circular", harmonics=2, groups=groups)
+    pd.testing.assert_frame_equal(four, circ)
+
+
+def test_expand_features_rejects_unknown_basis(raw):
+    with pytest.raises(Exception):
+        expand_features(raw, basis="wavelet")
+
+
+def test_hurdle_columns_aggregate_to_the_gene_in_johnson():
+    x, rng = _zero_inflated(n=800)
+    df = pd.DataFrame({"g": x, "h": _zero_inflated(n=800, seed=1)[0]})
+    z = pd.DataFrame({"z0": np.sin(2 * df["g"]) + 0.1 * rng.normal(size=800),
+                      "z1": (df["h"] > 0) + 0.1 * rng.normal(size=800)})
+    frame, m, _ = expand_features(df, basis="hurdle_spline", spline_df=3)
+    ex = FeatureGroundedDecomposition(z, frame, m)
+    table = ex.johnson().table
+    assert list(table.columns[:-1]) == ["g", "h"]
+    assert np.allclose(table.sum(axis=1), 1.0, atol=1e-6)
+
+
+def test_capacity_ladder_passes_basis_through():
+    x, rng = _zero_inflated(n=400)
+    df = pd.DataFrame({"g": x})
+    z = pd.DataFrame({"z0": np.sqrt(df["g"]) + 0.1 * rng.normal(size=400)})
+    table, _ = capacity_ladder(z, df, levels=(1, 3), basis="hurdle_spline",
+                               figure=False)
+    assert list(table["n_features"]) == [2, 4]

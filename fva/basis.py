@@ -40,14 +40,28 @@ Which basis is right is decided by the feature, not by taste:
   degenerates *exactly* to the raw column at ``spline_df=1`` (a degree-1 B-spline
   on two boundary knots is the rescaled identity), so again the ladder starts at
   the unexpanded bank.
+* A **zero-inflated continuous** feature (a gene's log-normalized expression,
+  where most cells sit exactly at zero) is better served by a hurdle spline,
+  ``basis="hurdle_spline"``: an indicator of leaving the point mass plus a cubic
+  B-spline on the values off it, with knots at quantiles of those values alone.
+  A plain spline puts its quantile knots on the point mass, where they coincide
+  with the boundary and are dropped, so it silently degrades into one global
+  polynomial fitted mostly to the tail.  The hurdle basis spans the on/off jump
+  and the dose-response separately, and it contains the raw column, so its
+  ``R^2`` is never below the unexpanded bank's.
 
-``mode="auto"`` applies that rule per column.  ``mode="circular"`` forces
-harmonics onto every numeric column, imposing a period equal to the observed
-range and carrying the raw column as the ramp; it reproduces the separable
-Fourier banks that appear in the literature and is provided for comparison, with
-a warning.  ``mode="spline"`` forces splines onto every numeric column,
-including the circular ones, which drops the wrap constraint those columns
-genuinely need.
+``basis`` chooses the expansion for non-periodic numeric columns: ``"none"``
+(the raw column, no capacity), ``"spline"`` (the default), ``"hurdle_spline"``,
+or ``"fourier"``.  A numeric column with no values at the point mass has nothing
+for a hurdle to separate and falls back to a plain spline, with a warning.
+
+``mode="auto"`` gives circular columns harmonics and every other numeric column
+the ``basis``.  ``mode="circular"`` forces harmonics onto every numeric column,
+imposing a period equal to the observed range and carrying the raw column as the
+ramp; it reproduces the separable Fourier banks that appear in the literature,
+is the same as ``basis="fourier"``, and is provided for comparison, with a
+warning.  ``mode="spline"`` applies the ``basis`` to the circular columns too,
+which drops the wrap constraint those columns genuinely need.
 
 Interactions
 ------------
@@ -146,6 +160,12 @@ MAX_SPLINE_DEGREE = 3
 #: the *unexpanded* bank for both bases, so the first rung is the baseline every
 #: other rung has to beat.
 DEFAULT_LEVELS = (1, 2, 3, 4, 6, 8)
+
+#: Expansions available for a non-periodic numeric column (see :func:`expand_features`).
+BASES = ("none", "spline", "hurdle_spline", "fourier")
+
+#: Suffix of the point-mass indicator column a hurdle spline emits.
+HURDLE_INDICATOR = "nz"
 
 #: Separator joining the two halves of an interaction column or group name.
 #: Spaced so that a pair reads as a pair in a legend without needing a lookup,
@@ -305,6 +325,70 @@ def spline_basis(x: FloatArray, df: PositiveInt = 4, *,
 
 
 @validate_call(config=VALIDATE_CONFIG)
+def hurdle_spline_basis(x: FloatArray, df: PositiveInt = 4, *, at: float = 0.0,
+                        name: str = "x") -> tuple[np.ndarray, list[str]]:
+    """Hurdle basis: a point-mass indicator plus a spline off the point mass.
+
+    Built for zero-inflated features such as log-normalized gene expression.
+    The first column is ``1[x != at]``, which carries the jump between the point
+    mass and the rest of the distribution.  The remaining ``df`` columns are the
+    :func:`spline_basis` of the values off the point mass, with knots at their
+    quantiles, and are zero on the point mass.  The spline's dropped reference
+    function is what the indicator replaces, so the basis is full rank.
+
+    The span contains ``x - at``, so an expanded column is never less expressive
+    than the raw one.  ``df=1`` is the two-part linear model (a jump plus a
+    slope), not the raw column, so a capacity ladder over a hurdle bank starts one
+    step above the unexpanded bank.
+
+    Parameters
+    ----------
+    x : (n,) array_like
+        The feature column.  Non-finite entries propagate as ``NaN`` rows.
+    df : int, default 4
+        Columns of the spline part.  The basis has ``df + 1`` columns, or just
+        the indicator when the values off the point mass are all equal.
+    at : float, default 0.0
+        The location of the point mass.
+    name : str
+        Prefix for the returned column names.
+
+    Returns
+    -------
+    (basis, names)
+        ``names`` are ``f"{name}=nz"`` followed by ``f"{name}=s1"`` ... .
+
+    Raises
+    ------
+    ValueError
+        If no finite value lies at ``at`` or none lies off it; a hurdle has
+        nothing to separate.  :func:`expand_features` falls back to a plain
+        spline in that case.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    finite = np.isfinite(x)
+    on = finite & (x == at)
+    off = finite & (x != at)
+    if not on.any() or not off.any():
+        raise ValueError(
+            f"column {name!r} has {int(on.sum())} value(s) at the point mass "
+            f"{at:g} and {int(off.sum())} off it; a hurdle basis needs both."
+        )
+
+    ind = off.astype(float)
+    ind[~finite] = np.nan
+    cols, names = [ind[:, None]], [f"{name}{ENCODED_SEP}{HURDLE_INDICATOR}"]
+    if np.unique(x[off]).size > 1:
+        S = np.zeros((x.size, int(df)))
+        S_off, snames = spline_basis(x[off], int(df), name=name)
+        S[off] = S_off
+        S[~finite] = np.nan
+        cols.append(S)
+        names += snames
+    return np.column_stack(cols), names
+
+
+@validate_call(config=VALIDATE_CONFIG)
 def harmonic_basis(x: FloatArray, period: float, harmonics: PositiveInt = 1, *,
                    name: str = "x") -> tuple[np.ndarray, list[str]]:
     """Fourier basis ``sin/cos(2 pi k v / period)`` for ``k = 1..harmonics``.
@@ -431,8 +515,10 @@ def expand_features(
     df: InstanceOf[pd.DataFrame],
     *,
     mode: Literal["auto", "spline", "circular"] = "auto",
+    basis: Literal["none", "spline", "hurdle_spline", "fourier"] = "spline",
     spline_df: PositiveInt = 4,
     harmonics: PositiveInt = 1,
+    hurdle_at: float = 0.0,
     interactions: list[tuple[str, str]] | None = None,
     categorical: list[str] | None = None,
     circular: dict[str, float] | list[str] | None = None,
@@ -458,19 +544,31 @@ def expand_features(
         Raw features, one column per feature.
     mode : {"auto", "spline", "circular"}, default "auto"
         ``"auto"`` picks per column: one-hot for categoricals, harmonics for
-        circular columns, splines for everything else numeric.  ``"spline"``
-        forces splines onto every numeric column, circular ones included, which
+        circular columns, ``basis`` for everything else numeric.  ``"spline"``
+        applies ``basis`` to every numeric column, circular ones included, which
         gives up the wrap those columns need.  ``"circular"`` forces harmonics
         onto every numeric column, imposing a period equal to the observed range
         for the ones that are not periodic and carrying the raw column alongside
         as the ramp that lets the fit break the imposed wrap-around.  Both forced
         modes warn on the columns they mis-handle; they exist so the choice of
         basis can be ablated rather than asserted.
+    basis : {"none", "spline", "hurdle_spline", "fourier"}, default "spline"
+        Expansion of the non-periodic numeric columns.  ``"none"`` keeps the raw
+        column.  ``"spline"`` is a cubic B-spline of ``spline_df`` columns.
+        ``"hurdle_spline"`` is an indicator of ``x != hurdle_at`` plus a cubic
+        B-spline of ``spline_df`` columns fitted to the values off the point
+        mass (see :func:`hurdle_spline_basis`); use it for zero-inflated features
+        such as gene expression.  A column with no values at ``hurdle_at`` falls
+        back to ``"spline"`` with a warning.  ``"fourier"`` is the same as
+        ``mode="circular"``.
     spline_df : int, default 4
-        Columns per spline-expanded feature.  ``1`` is the raw column.
+        Columns per spline-expanded feature (the spline part of a hurdle
+        spline).  ``1`` is the raw column for ``"spline"``.
     harmonics : int, default 1
         Harmonics per circular feature; ``2 * harmonics`` columns.  ``1`` is the
         faithful ``sin``/``cos`` encoding.
+    hurdle_at : float, default 0.0
+        Location of the point mass for ``basis="hurdle_spline"``.
     interactions : list of (str, str), optional
         Pairs of *source* column names whose bases are multiplied together and
         added as one further group per pair, named ``"a x b"``.  The width is the
@@ -583,11 +681,48 @@ def expand_features(
                 )
             values = s.to_numpy(dtype=float)
             is_circular = col in circ_cols
-            use = ("harmonic" if mode == "circular"
-                   else "spline" if mode == "spline"
-                   else "harmonic" if is_circular else "spline")
+            if mode == "circular" or (mode == "auto" and is_circular):
+                use = "fourier"
+            else:
+                use = basis
+                if is_circular and use != "fourier":
+                    warnings.warn(
+                        f"mode='spline' expands the circular column {name!r} on "
+                        f"basis={basis!r}, which does not wrap: the fit sees the "
+                        f"two ends of the turn as far apart when they are "
+                        f"adjacent. Use mode='auto' to give it harmonics.",
+                        stacklevel=3,
+                    )
+            if use == "hurdle_spline" and not np.any(values == hurdle_at):
+                warnings.warn(
+                    f"basis='hurdle_spline' found no values of {name!r} at the "
+                    f"point mass {hurdle_at:g}, so there is no hurdle to separate; "
+                    f"it gets a plain spline instead.",
+                    stacklevel=3,
+                )
+                use = "spline"
 
-            if use == "harmonic":
+            if use == "none":
+                finite = values[np.isfinite(values)]
+                part = pd.DataFrame({name: values}, index=s.index)
+                spec_rows.append({"column": name, "basis": "identity",
+                                  "requested": 1, "emitted": 1,
+                                  "distinct": int(np.unique(finite).size)})
+            elif use == "hurdle_spline":
+                finite = values[np.isfinite(values)]
+                off_vals = finite[finite != hurdle_at]
+                n_off = int(np.unique(off_vals).size)
+                d = (_clip_width(int(spline_df), off_vals, name, "hurdle spline")
+                     if n_off > 1 else int(spline_df))
+                B, bnames = hurdle_spline_basis(values, d, at=hurdle_at, name=name)
+                part = pd.DataFrame(B, columns=bnames, index=s.index)
+                spec_rows.append({"column": name,
+                                  "basis": f"hurdle_bspline(at={hurdle_at:g}, df={d}, "
+                                           f"zero_frac={np.mean(finite == hurdle_at):.2f})",
+                                  "requested": int(spline_df) + 1,
+                                  "emitted": part.shape[1],
+                                  "distinct": int(np.unique(finite).size)})
+            elif use == "fourier":
                 if is_circular:
                     period = circ_cols[col]
                     if period is None:
@@ -604,12 +739,12 @@ def expand_features(
                     # column below is the only thing that can pull them apart.
                     period = span
                     warnings.warn(
-                        f"mode='circular' expands the non-periodic column {name!r} "
-                        f"on a Fourier basis with the period set to its observed "
+                        f"the Fourier basis expands the non-periodic column {name!r} "
+                        f"with the period set to its observed "
                         f"range ({span:.4g}), which forces the fitted function to "
                         f"take the same value at both ends. The raw column is "
-                        f"carried alongside to offset that. Use mode='auto' for a "
-                        f"spline, which has no such constraint.",
+                        f"carried alongside to offset that. Use basis='spline' for "
+                        f"a spline, which has no such constraint.",
                         stacklevel=3,
                     )
                 # Clip on the width actually emitted (two columns per harmonic,
@@ -629,14 +764,6 @@ def expand_features(
                                   "distinct": int(np.unique(
                                       values[np.isfinite(values)]).size)})
             else:
-                if is_circular:
-                    warnings.warn(
-                        f"mode='spline' expands the circular column {name!r} on a "
-                        f"spline basis, which does not wrap: the fit sees the two "
-                        f"ends of the turn as far apart when they are adjacent. "
-                        f"Use mode='auto' to give it harmonics.",
-                        stacklevel=3,
-                    )
                 d = _clip_width(int(spline_df), values, name, "spline")
                 B, bnames = spline_basis(values, d, name=name)
                 part = pd.DataFrame(B, columns=bnames, index=s.index)
@@ -723,6 +850,8 @@ def capacity_ladder(
     *,
     levels: list[int] | tuple[int, ...] = DEFAULT_LEVELS,
     mode: Literal["auto", "spline", "circular"] = "auto",
+    basis: Literal["none", "spline", "hurdle_spline", "fourier"] = "spline",
+    hurdle_at: float = 0.0,
     interactions: list[tuple[str, str]] | None = None,
     categorical: list[str] | None = None,
     circular: dict[str, float] | list[str] | None = None,
@@ -760,7 +889,7 @@ def capacity_ladder(
         Raw (unexpanded) features.
     levels : sequence of int, default :data:`DEFAULT_LEVELS`
         Capacities to walk, in order.
-    mode, interactions, categorical, circular, groups, infer
+    mode, basis, hurdle_at, interactions, categorical, circular, groups, infer
         Passed to :func:`expand_features` at every rung.  An interaction is held
         fixed while the per-column capacity varies, so each rung is the same
         pairs at the width that rung sets --- the ladder then reads as one
@@ -802,8 +931,8 @@ def capacity_ladder(
             # once, from the widest rung that triggers them.
             warnings.simplefilter("ignore", UserWarning)
             frame, feat_to_group, _ = expand_features(
-                df_raw, mode=mode, spline_df=int(level), harmonics=int(level),
-                interactions=interactions, categorical=categorical,
+                df_raw, mode=mode, basis=basis, hurdle_at=hurdle_at,
+                spline_df=int(level), harmonics=int(level), interactions=interactions, categorical=categorical,
                 circular=circular, groups=groups, infer=infer,
             )
             decomp = FeatureGroundedDecomposition(

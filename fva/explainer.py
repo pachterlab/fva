@@ -44,6 +44,7 @@ each table.
 from __future__ import annotations
 
 import logging
+import re
 import warnings
 from typing import Literal, NamedTuple
 
@@ -53,6 +54,8 @@ from pydantic import InstanceOf, NonNegativeInt, PositiveInt, validate_call
 
 from . import viz
 from ._validation import VALIDATE_CONFIG, FigOut, FigSize
+from .basis import HURDLE_INDICATOR, INTERACTION_SEP
+from .encoding import ENCODED_SEP
 from .decomposition import (
     MAX_LEVELS,
     DecompositionResult,
@@ -67,6 +70,25 @@ from .decomposition import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: A column emitted by :func:`fva.basis.spline_basis` (``"<feature>=s<i>"``) or
+#: the indicator of :func:`fva.basis.hurdle_spline_basis` (``"<feature>=nz"``).
+_SPLINE_COLUMN = re.compile(
+    rf"^(?P<source>.+){re.escape(ENCODED_SEP)}(?:s\d+|{HURDLE_INDICATOR})$")
+
+
+def _spline_source(column: str) -> str | None:
+    """The source feature of a spline (or spline-by-spline tensor) column.
+
+    Returns ``None`` for any other column.  A tensor-product column
+    ``"a=s1 x b=s2"`` maps to the interaction ``"a x b"`` only when every factor
+    is a spline column, which is how :func:`fva.expand_features` names them.
+    """
+    parts = str(column).split(INTERACTION_SEP)
+    matches = [_SPLINE_COLUMN.match(p) for p in parts]
+    if not all(matches):
+        return None
+    return INTERACTION_SEP.join(m.group("source") for m in matches)
 
 
 class Report(NamedTuple):
@@ -154,6 +176,18 @@ class FeatureGroundedDecomposition:
         them only when a loop is long enough to be worth watching, which in
         practice means the ``2**g`` Shapley coalitions once there are more than a
         few groups.  ``False`` silences them.
+    feature_sources : dict, optional
+        Maps a column of ``df_feat`` to the feature it was expanded from, so that
+        the per-feature (Johnson) reports sum the relative weights of all its
+        basis columns into one entry.  The weight of a single basis column is not
+        interpretable on its own: the columns of one basis are strongly
+        correlated and only span the fitted function jointly.  ``None`` (the
+        default) infers the mapping from the names :func:`fva.expand_features`
+        gives spline columns, ``"<feature>=s<i>"``, and hurdle indicators,
+        ``"<feature>=nz"``, and sends a spline-by-spline
+        tensor column ``"a=s1 x b=s2"`` to its interaction ``"a x b"``.  Columns
+        not mapped are reported as themselves, so ``{}`` turns the aggregation
+        off.  Every column of one source must belong to the same group.
 
     Warns
     -----
@@ -185,6 +219,7 @@ class FeatureGroundedDecomposition:
         n_bootstrap: NonNegativeInt = 0,
         seed: int = 0,
         progress: bool | None = None,
+        feature_sources: dict[str, str] | None = None,
     ):
         df_latent, df_feat = self._align(df_latent, df_feat)
         self._check_numeric(df_feat)
@@ -202,6 +237,12 @@ class FeatureGroundedDecomposition:
         self.feature_names = list(df_feat.columns)
         self.groups = self._invert_mapping(self.feature_names, feat_to_group)
         self.group_names = list(self.groups.keys())
+
+        # Per-feature reports are taken over source features, not basis columns.
+        self.feature_sources = self._resolve_sources(
+            self.feature_names, feature_sources, self.groups)
+        self.source_names = list(dict.fromkeys(
+            self.feature_sources[f] for f in self.feature_names))
 
         # Labels for the latent directions (rows of the report tables).  Filled
         # in after fitting for both modes -- see _make_dir_labels.
@@ -286,6 +327,50 @@ class FeatureGroundedDecomposition:
                 stacklevel=3,
             )
         return groups
+
+    @staticmethod
+    def _resolve_sources(feature_names: list[str], feature_sources: dict | None,
+                         groups: dict) -> dict:
+        """Map every column to the source feature its weight is reported under.
+
+        Spline columns are inferred from their names when ``feature_sources`` is
+        ``None``; unmapped columns map to themselves.  A source whose columns are
+        split across groups is rejected, since its summed weight would then not
+        refine any one group's Shapley share.
+        """
+        if feature_sources is None:
+            sources = {}
+            for f in feature_names:
+                src = _spline_source(f)
+                sources[f] = f if src is None else src
+        else:
+            unknown = [c for c in feature_sources if c not in feature_names]
+            if unknown:
+                raise ValueError(
+                    f"feature_sources names column(s) not in df_feat: {unknown[:5]}"
+                    + (" ..." if len(unknown) > 5 else "")
+                )
+            sources = {f: str(feature_sources.get(f, f)) for f in feature_names}
+
+        feat_group = {f: g for g, fs in groups.items() for f in fs}
+        src_groups: dict[str, set] = {}
+        for f, src in sources.items():
+            src_groups.setdefault(src, set()).add(feat_group.get(f))
+        split = {s: sorted(map(str, g)) for s, g in src_groups.items() if len(g) > 1}
+        if split:
+            raise ValueError(
+                f"the basis columns of feature(s) {list(split)[:5]} fall in more "
+                f"than one group ({list(split.values())[:5]}); every column "
+                f"expanded from one feature must share its group."
+            )
+        return sources
+
+    def _aggregate_by_source(self, weights: dict) -> dict:
+        """Sum per-column weights into per-source-feature weights."""
+        out = dict.fromkeys(self.source_names, 0.0)
+        for f, w in weights.items():
+            out[self.feature_sources.get(f, f)] += float(w)
+        return out
 
     def _fit(self) -> "FeatureGroundedDecomposition":
         """Run (and cache) the decomposition.  Called automatically when needed."""
@@ -566,7 +651,9 @@ class FeatureGroundedDecomposition:
         eigenvalue-weighted-sum row, one column per feature, and a final
         ``noise`` column.  The feature columns are the Johnson relative weights;
         features plus noise partition each direction's variance, so every row sums
-        to 1.
+        to 1.  A feature expanded onto a spline basis gets one column holding the
+        sum of the weights of all its basis columns (see ``feature_sources``), so
+        ``q`` here counts source features rather than columns of ``df_feat``.
 
         ``figure_type`` selects the figure: ``"heatmap"`` (default) draws a
         direction-by-feature grid; ``"bar"`` draws one stacked bar per direction.
@@ -588,11 +675,12 @@ class FeatureGroundedDecomposition:
         default location ``figures/johnson.png``.
         """
         res = self._res
-        attributions = [d.feature_weights for d in res.directions]
-        table = self._build_table(self.feature_names, attributions,
+        attributions = [self._aggregate_by_source(d.feature_weights)
+                        for d in res.directions]
+        table = self._build_table(self.source_names, attributions,
                                   self._global_feature_shares())
         fig = self._budget_figure(
-            table, self.feature_names, figure_type=figure_type,
+            table, self.source_names, figure_type=figure_type,
             color_of=self._feature_color(), col_label="feature",
             top_k=top_k, top_n=top_n, figsize=figsize, null_line=null_line,
             total=total,
@@ -929,20 +1017,21 @@ class FeatureGroundedDecomposition:
         return table
 
     def _global_feature_shares(self) -> dict:
-        """Variance-weighted global relative weight of each feature.
+        """Variance-weighted global relative weight of each source feature.
 
         Mirrors :attr:`DecompositionResult.global_group_shares` at the feature
         level: ``sum_k (lambda_k / sum lambda) * eps_{k,j}``, summing over features
-        to the global ``R^2``.
+        to the global ``R^2``.  Basis columns are summed into their source feature.
         """
         res = self._res
         vfrac = np.array([d.variance_frac for d in res.directions])
         vfrac = vfrac / vfrac.sum()
-        return {
+        per_column = {
             f: float(sum(w * d.feature_weights.get(f, 0.0)
                          for w, d in zip(vfrac, res.directions)))
             for f in self.feature_names
         }
+        return self._aggregate_by_source(per_column)
 
     def _null_floor_shape(self):
         """``(n, q)`` for the noise-floor line: the shape the fit actually saw.
@@ -991,6 +1080,7 @@ class FeatureGroundedDecomposition:
     def _feature_color(self):
         """Color function keying each feature to its group's stable color."""
         feat_group = {f: g for g, fs in self.groups.items() for f in fs}
+        feat_group.update({self.feature_sources[f]: g for f, g in list(feat_group.items())})
         group_idx = {g: i for i, g in enumerate(self.group_names)}
         def color_of(name, i):
             g = feat_group.get(name, name)
