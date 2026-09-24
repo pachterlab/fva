@@ -4,7 +4,7 @@ on:
   push:
     branches: [ "main", "dev" ]
     paths:
-      - 'fgvb/**'
+      - 'fva/**'
       - 'tests/**'
       - 'notebooks/**'
       - 'pyproject.toml'

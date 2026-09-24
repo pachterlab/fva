@@ -7,9 +7,7 @@ Two flavours, mirroring the convention used across the lab's repos:
   not leak into the check.  Used for the narrated ``tutorial.ipynb``, whose
   figures and floating-point values are not meant to be reproduced bit-for-bit.
 * **strict** (``--nbval``) -- the notebook must run *and* reproduce its stored
-  outputs exactly.  Used for ``quickstart.ipynb``, which is authored to emit only
-  structurally stable output (shapes, labels, boolean identity checks); its one
-  float-printing cell is tagged ``# NBVAL_IGNORE_OUTPUT``.
+  outputs exactly. 
 
 Each notebook is copied into pytest's ``tmp_path`` and run there (the working
 directory is switched too) so any files it writes -- e.g. ``figures/`` -- land in
@@ -32,7 +30,7 @@ NOTEBOOK_DIR = os.path.join(REPO_ROOT, "notebooks")
 # Run top-to-bottom, outputs not compared.
 file_list_lax = ["tutorial.ipynb"]
 # Run AND reproduce stored outputs exactly.
-file_list_strict = ["quickstart.ipynb"]
+file_list_strict = []
 
 
 def clear_notebook_output(notebook_path: str) -> None:

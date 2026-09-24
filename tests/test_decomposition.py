@@ -1,4 +1,4 @@
-"""Unit tests for the core decomposition math in :mod:`fgvb.decomposition`.
+"""Unit tests for the core decomposition math in :mod:`fva.decomposition`.
 
 These exercise the linear-algebra primitives directly (subset ``R^2``, the group
 Shapley game, Johnson relative weights, cross-validated ``R^2``) and the
@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
-from fgvb.decomposition import (
+from fva.decomposition import (
     DecompositionResult,
     _GramCache,
     _shapley_groups,
     cv_r2,
     decompose_latent_space,
+    direction_r2,
     feature_grounded_codes,
     relative_weights,
 )
@@ -188,11 +190,12 @@ def test_decompose_axes_mode_matches_columns():
 
 
 def test_decompose_invalid_mode_raises():
+    """An unknown mode is rejected by the signature, naming the offending argument."""
     rng = np.random.default_rng(10)
     Z = rng.normal(size=(50, 2))
     F = rng.normal(size=(50, 2))
     names = ["a", "b"]
-    with pytest.raises(ValueError, match="unknown mode"):
+    with pytest.raises(ValueError, match="mode"):
         decompose_latent_space(Z, F, names, {"a": ["a"], "b": ["b"]}, mode="bogus")
 
 
@@ -242,3 +245,191 @@ def test_feature_grounded_codes_shape_and_reconstruction(dataset):
     num = np.var(df_latent.values - zhat)
     den = np.var(df_latent.values)
     assert num / den < 0.5
+
+
+# ------------------------------------------------------------ argument validation
+def test_array_arguments_accept_array_likes(dataset):
+    """Lists and DataFrames still work: the boundary coerces them with asarray."""
+    df_latent, df_feat, feat_to_group = dataset
+    groups = {}
+    for f, g in feat_to_group.items():
+        groups.setdefault(g, []).append(f)
+    from_frames = decompose_latent_space(
+        df_latent, df_feat, list(df_feat.columns), groups, seed=0,
+    )
+    from_lists = decompose_latent_space(
+        df_latent.values.tolist(), df_feat.values.tolist(),
+        list(df_feat.columns), groups, seed=0,
+    )
+    assert from_frames.global_r2 == pytest.approx(from_lists.global_r2)
+
+
+def test_non_numeric_array_rejected_at_the_boundary():
+    """A non-numeric input is reported against the parameter that carried it."""
+    with pytest.raises(ValidationError, match="Z|convert"):
+        decompose_latent_space("not an array", np.zeros((4, 1)), ["a"], {"a": ["a"]})
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"n_directions": 0},        # fewer than one direction is meaningless
+    {"n_bootstrap": -1},        # a negative number of resamples
+    {"feature_names": 3},       # names must be a list
+    {"seed": "later"},          # not an int
+])
+def test_decompose_rejects_bad_arguments(kwargs):
+    rng = np.random.default_rng(12)
+    call = dict(Z=rng.normal(size=(30, 2)), F=rng.normal(size=(30, 2)),
+                feature_names=["a", "b"], groups={"a": ["a"], "b": ["b"]})
+    call.update(kwargs)
+    with pytest.raises(ValidationError):
+        decompose_latent_space(**call)
+
+
+def test_cv_r2_accepts_lists():
+    """The 1-D helpers coerce too, so a plain list target is fine."""
+    rng = np.random.default_rng(13)
+    X = _standardize(rng.normal(size=(120, 3)))
+    y = X @ np.array([1.0, 0.0, -1.0])
+    assert cv_r2(X.tolist(), y.tolist(), folds=4, seed=0) > 0.8
+
+
+def test_relative_weights_rejects_ragged_input():
+    with pytest.raises(ValidationError):
+        relative_weights([[1.0, 2.0], [3.0]], [1.0, 2.0])
+
+
+# ------------------------------------------------------------------ direction_r2
+def test_direction_r2_agrees_with_full_decomposition(dataset):
+    """The screen reports exactly the totals the full decomposition reports.
+
+    This is the point of sharing ``_build_directions``: the screen is meant to be
+    the same numbers minus the attribution, so a divergence here means the two
+    entry points have drifted into analysing different directions.
+    """
+    df_latent, df_feat, feat_to_group = dataset
+    groups = {}
+    for f, g in feat_to_group.items():
+        groups.setdefault(g, []).append(f)
+    res = decompose_latent_space(
+        df_latent.values, df_feat.values, list(df_feat.columns), groups, seed=0,
+    )
+    table = direction_r2(df_latent, df_feat, seed=0)
+
+    rows = table.drop(index="weighted_sum")
+    assert len(rows) == len(res.directions)
+    for row, d in zip(rows.itertuples(), res.directions):
+        assert row.r2 == pytest.approx(d.r2, abs=1e-10)
+        assert row.r2_cv == pytest.approx(d.r2_cv, abs=1e-10)
+        assert row.variance_fraction == pytest.approx(d.variance_frac, abs=1e-12)
+        assert row.noise == pytest.approx(d.noise_frac, abs=1e-12)
+    assert table.loc["weighted_sum", "r2"] == pytest.approx(res.global_r2, abs=1e-10)
+    assert table.loc["weighted_sum", "r2_cv"] == pytest.approx(res.global_r2_cv, abs=1e-10)
+    assert table.loc["weighted_sum", "noise"] == pytest.approx(res.global_noise, abs=1e-10)
+
+
+def test_direction_r2_weighted_sum_is_the_variance_weighted_mean(dataset):
+    """The total row is the eigenvalue-weighted mean of the rows above it."""
+    df_latent, df_feat, _ = dataset
+    table = direction_r2(df_latent, df_feat, seed=0)
+    rows = table.drop(index="weighted_sum")
+    w = rows["variance_fraction"] / rows["variance_fraction"].sum()
+    assert table.loc["weighted_sum", "r2"] == pytest.approx(float(w @ rows["r2"]))
+    assert table.loc["weighted_sum", "variance_fraction"] == pytest.approx(1.0)
+    # noise is the complement of r2 on every row, total included.
+    assert (table["noise"] + table["r2"]).drop(index="weighted_sum").eq(1.0).all()
+    assert table.loc["weighted_sum", "noise"] == pytest.approx(
+        1.0 - table.loc["weighted_sum", "r2"])
+
+
+def test_direction_r2_screens_out_a_bank_with_no_signal():
+    """A noise bank scores near zero out of sample despite a healthy in-sample R^2.
+
+    The gap is the whole reason the screen reports both columns: at q/(n-1) = 0.2
+    the in-sample total would read as signal.
+    """
+    rng = np.random.default_rng(14)
+    Z = rng.normal(size=(100, 4))
+    F = rng.normal(size=(100, 20))
+    table = direction_r2(Z, F, seed=0)
+    assert table.loc["weighted_sum", "r2"] > 0.15      # inflated by the bank width
+    assert table.loc["weighted_sum", "r2_cv"] < 0.05   # and gone once held out
+    assert (table.drop(index="weighted_sum")["r2_cv"] < 0.1).all()
+
+
+def test_direction_r2_finds_signal_in_a_low_variance_direction():
+    """A direction can be well explained while carrying little of the variance.
+
+    Screening on the weighted total alone would miss it, which is why the table is
+    per-direction and the total is only the last row.
+    """
+    rng = np.random.default_rng(15)
+    n = 400
+    F = rng.normal(size=(n, 3))
+    planted = 0.1 * (F @ np.array([1.0, -0.5, 0.8]))   # small variance, near-exact
+    Z = np.column_stack([5.0 * rng.normal(size=n), planted])
+    table = direction_r2(Z, F, seed=0).drop(index="weighted_sum")
+    quiet = table["variance_fraction"].idxmin()
+    assert table.loc[quiet, "variance_fraction"] < 0.01
+    assert table.loc[quiet, "r2_cv"] > 0.9
+    # The weighted total, dominated by the loud unexplained direction, hides it.
+    assert direction_r2(Z, F, seed=0).loc["weighted_sum", "r2_cv"] < 0.1
+
+
+def test_direction_r2_n_directions_truncates_and_renormalises():
+    """With ``n_directions`` the total covers only the directions screened."""
+    rng = np.random.default_rng(16)
+    Z = rng.normal(size=(150, 5)) @ np.diag([5.0, 4.0, 1.0, 1.0, 1.0])
+    F = rng.normal(size=(150, 4))
+    table = direction_r2(Z, F, n_directions=2, seed=0)
+    assert len(table) == 2 + 1
+    # The variance_fraction total is the screened share, well under 1...
+    assert table.loc["weighted_sum", "variance_fraction"] < 1.0
+    # ...while the R^2 total still uses weights renormalised over those two.
+    rows = table.drop(index="weighted_sum")
+    w = rows["variance_fraction"] / rows["variance_fraction"].sum()
+    assert table.loc["weighted_sum", "r2"] == pytest.approx(float(w @ rows["r2"]))
+
+
+def test_direction_r2_axes_mode_labels_name_the_latent_columns():
+    """``mode='axes'`` labels each row with the latent column it came from."""
+    rng = np.random.default_rng(17)
+    n = 200
+    # Column variances ascend, so the variance ordering reverses the column order
+    # and a positional label would attach every row to the wrong column.
+    Z = rng.normal(size=(n, 3)) @ np.diag([1.0, 3.0, 9.0])
+    F = rng.normal(size=(n, 3))
+    table = direction_r2(Z, F, mode="axes", latent_names=["lo", "mid", "hi"], seed=0)
+    assert list(table.index) == ["hi", "mid", "lo", "weighted_sum"]
+    # Without names the rows fall back to the source column position.
+    assert list(direction_r2(Z, F, mode="axes", seed=0).index) == ["2", "1", "0",
+                                                                  "weighted_sum"]
+
+
+def test_direction_r2_eigen_mode_labels_by_rank():
+    rng = np.random.default_rng(18)
+    Z = rng.normal(size=(80, 3))
+    F = rng.normal(size=(80, 2))
+    table = direction_r2(Z, F, seed=0)
+    assert list(table.index) == ["PC0", "PC1", "PC2", "weighted_sum"]
+    assert table.index.name == "direction"
+
+
+def test_direction_r2_warns_when_the_bank_outruns_the_sample():
+    """The screen carries the same sample-size diagnostic as the full fit."""
+    rng = np.random.default_rng(19)
+    with pytest.warns(UserWarning, match="samples for"):
+        direction_r2(rng.normal(size=(20, 2)), rng.normal(size=(20, 30)), seed=0)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"mode": "bogus"},
+    {"n_directions": 0},
+    {"cv_folds": "five"},
+    {"seed": "later"},
+])
+def test_direction_r2_rejects_bad_arguments(kwargs):
+    rng = np.random.default_rng(20)
+    call = dict(Z=rng.normal(size=(30, 2)), F=rng.normal(size=(30, 2)))
+    call.update(kwargs)
+    with pytest.raises(ValidationError):
+        direction_r2(**call)

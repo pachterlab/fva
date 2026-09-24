@@ -1,4 +1,4 @@
-"""Shared pytest configuration for the fgvb test suite.
+"""Shared pytest configuration for the fva test suite.
 
 Forces a headless Matplotlib backend so the figure-returning report methods can be
 exercised without a display, and provides small deterministic data fixtures used
@@ -49,7 +49,7 @@ def dataset():
 @pytest.fixture
 def explainer(dataset):
     """A fitted-on-demand :class:`FeatureGroundedDecomposition` over ``dataset``."""
-    from fgvb import FeatureGroundedDecomposition
+    from fva import FeatureGroundedDecomposition
 
     df_latent, df_feat, feat_to_group = dataset
     return FeatureGroundedDecomposition(df_latent, df_feat, feat_to_group, seed=0)
